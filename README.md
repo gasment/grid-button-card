@@ -16,7 +16,12 @@
 #### 此项目全部功能实现代码由AI生成 Power By ChatGPT
 ---
 ### 预览：
-
+![](https://github.com/gasment/grid-button-card/blob/main/preview1.webp)
+![](https://github.com/gasment/grid-button-card/blob/main/preview2.webp)
+- switch实体用例
+- ![](https://github.com/gasment/grid-button-card/blob/main/preview3.webp)
+- select实体用例
+- ![](https://github.com/gasment/grid-button-card/blob/main/preview4.webp)
 ### 安装说明：
 复制本项目仓库地址：https://github.com/gasment/grid-button-card ,在HACS添加Custom repositories，Repositories填写仓库地址，Type选择Dashboard； 搜索：grid-button-card，下载安装，按提示刷新页面
 
