@@ -169,6 +169,8 @@
 | state | 按钮的状态文本 | 可选，支持模板和字符串 | `state: example` |
 | icon | 按钮的图标 | 可选。可以是 mdi:xxxx 或一个图片URL。支持模板 | `icon: mdi:lightbulb` |
 | sync_state | 此按钮对应的状态值。当顶层的 sync_state 计算结果与此值相等时，此按钮将被高亮 | **必需**。通常为字符串 | 参考上文sync_state配置 |
+| confirm_dialog | 二次确认对话框，防误触 | 可选，接受true/false，支持模板和变量读取 | confirm_dialog: false |
+| confirm_dialog_content | 二次确认对话框内的文本提示|  可选，接受字符串，支持模板和变量读取 | confirm_dialog_content: 你确定要操作吗？|
 | sync_button_highlight | 定义当此按钮被高亮时，高亮层的背景颜色 | 可选，接受任何 CSS 颜色值，如 '#FF5722' 或 'rgba(255, 87, 34, 0.3)'。如果省略，会使用一个默认的蓝色 | `sync_button_highlight: blue` |
 | tap_action | 此按钮的点击动作 | 可选，写法与ha开发者选项中的动作yaml配置一致 | 见下文`tap_action`配置 |
 | styles | 定义此按钮及其内部元素的样式 | 可选。一个 CSS 样式对象数组。 | 见下文`button_grid -> styles`配置 |
