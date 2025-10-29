@@ -1,4 +1,4 @@
-// v1.0.1
+// v1.1.0
 class GridButtonCard extends HTMLElement {
   constructor() {
     super();
@@ -16,22 +16,31 @@ class GridButtonCard extends HTMLElement {
     this._optimisticHighlightKey = null;
     this._highlightRollbackTimer = null;
     this._contentUpdateTimer = null;
-    this._isUpdatingOptimistically = false; 
+    this._isUpdatingOptimistically = false;
 
     this._hlEl = null;
     this._lastTarget = { key: "", x: 0, y: 0, w: 0, h: 0, color: "" };
-    
+
     this._firstShown = false;
     this._allowAnimation = false;
 
     this._resizeObserver = null;
     this._onResizeRef = () => this._scheduleMove();
 
-        // —— NEW: 视图切换与测量稳态相关 —— 
-    this._rafMove = 0;                 // 合并/取消重复 _scheduleMove
-    this._measureRetryCount = 0;       // 当前测量重试计数
-    this._measureRetryMax = 60;        // 最多 60 帧（≈1s）rAF 重试
-    this._viewMo = null;               // 观察所属 view 的 MutationObserver
+    this._rafMove = 0;
+    this._measureRetryCount = 0;
+    this._measureRetryMax = 60;
+    this._viewMo = null;
+
+    // 全局确认层
+    this._confirmRoot = null;       // backdrop
+    this._confirmDialogEl = null;   // dialog
+    this._confirmTextEl = null;     // text node
+    this._confirmShown = false;
+    this._pendingConfirm = null;
+    this._confirmAnchorEl = null;
+    this._repositionHandler = null;
+    this._repositionRAF = 0;
   }
 
   /* ================== HA Lifecycle ================== */
@@ -54,9 +63,7 @@ class GridButtonCard extends HTMLElement {
     this._hass = hass;
 
     if (!this._initialMounted || hass.states !== old?.states) {
-      if (this._isUpdatingOptimistically) {
-        return;
-      }
+      if (this._isUpdatingOptimistically) return;
 
       if (!this._initialMounted) {
         this._initialMounted = true;
@@ -72,12 +79,18 @@ class GridButtonCard extends HTMLElement {
     });
   }
 
-  /* ================== Structure (No changes) ================== */
+  /* ================== Structure ================== */
 
   _render() {
     const style = document.createElement("style");
     style.textContent = `
-      .grid-container { display: grid; width: 100%; position: relative; }
+      .grid-container {
+        display: grid;
+        width: 100%;
+        position: relative;
+        isolation: isolate;
+        contain: paint;
+      }
       .grid-item {
         position: relative;
         box-sizing: border-box; min-width: 0; min-height: 0; overflow: visible;
@@ -110,6 +123,7 @@ class GridButtonCard extends HTMLElement {
       .part img { max-width: 100%; max-height: 100%; object-fit: contain; }
       .part ha-icon { display: inline-block; }
 
+      /* 高亮层使用 top/left/width/height 过渡（iOS 稳定） */
       .gbc-highlight {
         position: absolute;
         top: 0; left: 0;
@@ -117,12 +131,15 @@ class GridButtonCard extends HTMLElement {
         pointer-events: none;
         border-radius: var(--gbc-radius, 10px);
         opacity: 1;
-        transform-origin: top left;
-        transition: transform 500ms cubic-bezier(0.2, 0.9, 0.2, 1),
-                    background-color 320ms ease,
-                    border-radius 320ms ease,
-                    opacity 320ms ease;
-        will-change: transform, background-color;
+        transition:
+          top 420ms cubic-bezier(0.2, 0.9, 0.2, 1),
+          left 420ms cubic-bezier(0.2, 0.9, 0.2, 1),
+          width 420ms cubic-bezier(0.2, 0.9, 0.2, 1),
+          height 420ms cubic-bezier(0.2, 0.9, 0.2, 1),
+          background-color 240ms ease,
+          border-radius 240ms ease,
+          opacity 240ms ease;
+        will-change: top, left, width, height, background-color;
         box-shadow: 0 6px 18px rgba(0,0,0,0.18);
       }
     `;
@@ -134,15 +151,15 @@ class GridButtonCard extends HTMLElement {
     this.shadowRoot.innerHTML = "";
     this.shadowRoot.appendChild(style);
     this.shadowRoot.appendChild(wrapper);
+
     if (window.provideHass) window.provideHass(this);
 
     this._resizeObserver?.disconnect();
     this._resizeObserver = new ResizeObserver(() => this._scheduleMove());
     this._resizeObserver.observe(wrapper);
     window.addEventListener("resize", this._onResizeRef);
-    // —— NEW: 监听所属 HA 视图从隐藏→可见 —— 
+
     const findViewHost = () => {
-      // hui-view 或 hui-panel-view（不同主题/版本命名略有差异）
       let n = this;
       const getHost = (x) => (x && x.getRootNode && x.getRootNode() instanceof ShadowRoot) ? x.getRootNode().host : null;
       while (n) {
@@ -150,7 +167,6 @@ class GridButtonCard extends HTMLElement {
         const host = getHost(n);
         n = n.parentNode || host;
       }
-      // 继续向上找 hui-view / hui-panel-view
       while (n) {
         if (n.tagName && /^(HUI-VIEW|HUI-PANEL-VIEW)/i.test(n.tagName)) return n;
         n = n.parentNode || getHost(n);
@@ -162,9 +178,8 @@ class GridButtonCard extends HTMLElement {
     const view = findViewHost();
     if (view) {
       this._viewMo = new MutationObserver(() => {
-        // 视图任何属性变化（尤其是 hidden/style.display）后，给两帧再重算
         this._measureRetryCount = 0;
-        this._scheduleMove(/*doubleFrame*/ true);
+        this._scheduleMove(true);
       });
       this._viewMo.observe(view, { attributes: true, attributeFilter: ["hidden", "style", "class"] });
     }
@@ -173,20 +188,20 @@ class GridButtonCard extends HTMLElement {
   disconnectedCallback() {
     super.disconnectedCallback?.();
     this._resizeObserver?.disconnect();
-    this._viewMo?.disconnect?.();   // NEW
-    this._viewMo = null;            // NEW
-    if (this._rafMove) cancelAnimationFrame(this._rafMove), this._rafMove = 0; // NEW
+    this._viewMo?.disconnect?.();
+    this._viewMo = null;
+    if (this._rafMove) cancelAnimationFrame(this._rafMove), this._rafMove = 0;
     window.removeEventListener("resize", this._onResizeRef);
     clearTimeout(this._highlightRollbackTimer);
     clearTimeout(this._contentUpdateTimer);
+    this._teardownConfirmLayer();
   }
-
 
   _mountButtons() {
     const wrapper = this.shadowRoot.querySelector(".grid-container");
     if (!wrapper) return;
 
-    wrapper.innerHTML = "";
+    wrapper.querySelectorAll(".grid-item").forEach(el => el.remove());
 
     const btns = this._finalConfig?.button_grid || {};
     for (const areaName of Object.keys(btns)) {
@@ -217,7 +232,7 @@ class GridButtonCard extends HTMLElement {
     this._applyButtonContent();
   }
 
-  /* ================== Styles (No changes) ================== */
+  /* ================== Styles ================== */
   _applyDynamicStyles() {
     if (!this._finalConfig || !this.shadowRoot) return;
     const wrapper = this.shadowRoot.querySelector(".grid-container");
@@ -290,10 +305,9 @@ class GridButtonCard extends HTMLElement {
     this._scheduleMove();
   }
 
-  /* ================== Content (No changes) ================== */
+  /* ================== Content ================== */
   _applyButtonContent() {
     const btns = this._finalConfig?.button_grid || {};
-    
     Object.keys(btns).forEach((key) => {
       const cfg = btns[key];
       const selector = window.CSS?.escape ? CSS.escape(key) : key;
@@ -316,19 +330,17 @@ class GridButtonCard extends HTMLElement {
         }
 
         if (part.style.display === 'none') {
-            part.innerHTML = '';
-            part.style.display = '';
-            part.style.opacity = 1;
+          part.innerHTML = '';
+          part.style.display = '';
+          part.style.opacity = 1;
         }
-        
+
         const content = this._evaluateTemplate(rawVal);
 
         const applyUpdate = (updateFn) => {
           const style = window.getComputedStyle(part);
           let duration = parseFloat(style.transitionDuration) * 1000;
-          if (isNaN(duration) || duration <= 0) {
-            duration = 400;
-          }
+          if (isNaN(duration) || duration <= 0) duration = 400;
 
           part.style.opacity = 0;
           setTimeout(() => {
@@ -367,7 +379,6 @@ class GridButtonCard extends HTMLElement {
         }
       }
     });
-    
     this._isInitialContentLoaded = true;
   }
 
@@ -392,39 +403,308 @@ class GridButtonCard extends HTMLElement {
     }
   }
 
-  /* ================== Actions (No changes) ================== */
+  /* ================== Actions & Confirm ================== */
   _handleTap(e) {
     const item = e.composedPath().find(n => n?.classList?.contains?.("grid-item"));
     if (!item) return;
     const key = item.dataset.area;
     const cfg = (this._finalConfig?.button_grid || {})[key] || {};
 
-    if (key) {
-      clearTimeout(this._highlightRollbackTimer);
-      clearTimeout(this._contentUpdateTimer);
-      
-      this._isUpdatingOptimistically = true;
-      this._optimisticHighlightKey = key;
-      
-      this._allowAnimation = true;
-      this._scheduleMove();
+    // 二级确认
+    const needConfirm = this._evaluateTemplate(cfg.confirm_dialog) === true;
+    if (needConfirm) {
+      const text = (cfg.confirm_dialog_content !== undefined)
+        ? String(this._evaluateTemplate(cfg.confirm_dialog_content))
+        : "确定要执行该操作吗？";
 
-      this._contentUpdateTimer = setTimeout(() => {
-        this._isUpdatingOptimistically = false;
-        this._applyButtonContent();
-      }, 300);
+      // haptic
+      this.dispatchEvent(new CustomEvent('haptic', {
+        bubbles: true, composed: true, detail: 'heavy'
+      }));
 
-      this._highlightRollbackTimer = setTimeout(() => {
-        this._optimisticHighlightKey = null;
-        this._updateHighlightTarget();
-      }, this._syncStateDelay);
+      this._showConfirm(text, () => this._executeTap(key, cfg), item);
+      return;
     }
+
+    this._executeTap(key, cfg);
+  }
+
+  _ensureGlobalConfirmLayer() {
+    if (this._confirmRoot && document.body.contains(this._confirmRoot)) return;
+
+    // Backdrop
+    const backdrop = document.createElement("div");
+    backdrop.style.position = "fixed";
+    backdrop.style.inset = "0";
+    backdrop.style.zIndex = "2147483000";
+    backdrop.style.display = "none";
+    backdrop.style.background = this._finalConfig.confirm_dialog_backdrop || "rgba(0,0,0,0.60)";
+    backdrop.addEventListener("click", (e) => { if (e.target === backdrop) this._hideConfirm(); });
+
+    // Dialog
+    const dialog = document.createElement("div");
+    dialog.style.position = "fixed";
+    dialog.style.zIndex = "2147483001";    // 关键：高于遮罩
+    dialog.style.minWidth = "220px";
+    dialog.style.maxWidth = "80%";
+    dialog.style.maxHeight = "70vh";
+    dialog.style.overflow = "auto";
+    dialog.style.background = "var(--card-background-color, #fff)";
+    dialog.style.color = "var(--primary-text-color, #111)";
+    dialog.style.borderRadius = "12px";
+    dialog.style.boxShadow = "0 10px 30px rgba(0,0,0,.25)";
+    dialog.style.padding = "14px 16px";
+    dialog.style.boxSizing = "border-box";
+    dialog.style.opacity = "0";
+    dialog.style.transform = "translateY(6px)";
+    dialog.style.transition = "transform 160ms ease, opacity 160ms ease";
+    dialog.style.display = "none";         // 隐藏时真正不占位
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+    dialog.addEventListener("click", (e) => e.stopPropagation());
+
+    const title = document.createElement("div");
+    title.textContent = "确认操作";
+    title.style.fontWeight = "600";
+    title.style.margin = "0 0 8px 0";
+    title.style.fontSize = "15px";
+
+    const content = document.createElement("div");
+    content.textContent = "确定要执行该操作吗？";
+    content.style.fontSize = "14px";
+    content.style.margin = "0 0 12px 0";
+    content.style.wordBreak = "break-word";
+    this._confirmTextEl = content;
+
+    const actions = document.createElement("div");
+    actions.style.display = "flex";
+    actions.style.gap = "8px";
+    actions.style.justifyContent = "flex-end";
+
+    const btnCancel = document.createElement("button");
+    btnCancel.textContent = "取消";
+    btnCancel.style.appearance = "none";
+    btnCancel.style.border = "0";
+    btnCancel.style.borderRadius = "8px";
+    btnCancel.style.padding = "8px 12px";
+    btnCancel.style.cursor = "pointer";
+    btnCancel.style.font = "inherit";
+    btnCancel.style.background = "rgba(0,0,0,0.06)";
+    btnCancel.addEventListener("click", () => this._hideConfirm());
+
+    const btnOk = document.createElement("button");
+    btnOk.textContent = "确定";
+    btnOk.style.appearance = "none";
+    btnOk.style.border = "0";
+    btnOk.style.borderRadius = "8px";
+    btnOk.style.padding = "8px 12px";
+    btnOk.style.cursor = "pointer";
+    btnOk.style.font = "inherit";
+    btnOk.style.background = "var(--primary-color, #03a9f4)";
+    btnOk.style.color = "#fff";
+    btnOk.addEventListener("click", () => {
+      const fn = this._pendingConfirm;
+      this._hideConfirm();
+      if (typeof fn === "function") fn();
+    });
+
+    actions.appendChild(btnCancel);
+    actions.appendChild(btnOk);
+    dialog.appendChild(title);
+    dialog.appendChild(content);
+    dialog.appendChild(actions);
+
+    document.body.appendChild(backdrop);
+    document.body.appendChild(dialog);
+
+    this._confirmRoot = backdrop;
+    this._confirmDialogEl = dialog;
+  }
+
+  _showConfirm(text, onOk, anchorEl) {
+    this._ensureGlobalConfirmLayer();
+
+    this._pendingConfirm = onOk;
+    this._confirmTextEl.textContent = text || "确定要执行该操作吗？";
+    this._confirmAnchorEl = anchorEl || null;
+
+    // 先显示遮罩与对话框
+    this._confirmRoot.style.display = "block";
+    const dlg = this._confirmDialogEl;
+    dlg.style.display = "block";
+    dlg.style.opacity = "0";
+    dlg.style.transform = "translateY(6px)";
+    dlg.style.left = "0px";
+    dlg.style.top = "0px";
+
+    // 定位并入场
+    this._positionConfirmNear();
+    requestAnimationFrame(() => {
+      dlg.style.opacity = "1";
+      dlg.style.transform = "translateY(0)";
+    });
+
+    this._bindRepositionEvents();
+    this._confirmShown = true;
+  }
+
+  _hideConfirm() {
+    if (!this._confirmRoot || !this._confirmShown) return;
+    const dlg = this._confirmDialogEl;
+    dlg.style.transform = "translateY(6px)";
+    dlg.style.opacity = "0";
+    // 动画后真正隐藏
+    setTimeout(() => {
+      if (this._confirmRoot) this._confirmRoot.style.display = "none";
+      if (dlg) dlg.style.display = "none";
+    }, 160);
+    this._pendingConfirm = null;
+    this._confirmShown = false;
+    this._confirmAnchorEl = null;
+    this._unbindRepositionEvents();
+  }
+
+  _teardownConfirmLayer() {
+    this._unbindRepositionEvents();
+    if (this._confirmDialogEl && this._confirmDialogEl.parentNode === document.body) {
+      this._confirmDialogEl.remove();
+    }
+    if (this._confirmRoot && this._confirmRoot.parentNode === document.body) {
+      this._confirmRoot.remove();
+    }
+    this._confirmRoot = null;
+    this._confirmDialogEl = null;
+    this._confirmTextEl = null;
+    this._pendingConfirm = null;
+    this._confirmShown = false;
+    this._confirmAnchorEl = null;
+  }
+
+  _bindRepositionEvents() {
+    if (this._repositionHandler) return;
+    this._repositionHandler = () => {
+      if (!this._confirmShown) return;
+      if (this._repositionRAF) cancelAnimationFrame(this._repositionRAF);
+      this._repositionRAF = requestAnimationFrame(() => this._positionConfirmNear());
+    };
+    window.addEventListener("resize", this._repositionHandler, { passive: true });
+    window.addEventListener("scroll", this._repositionHandler, { passive: true, capture: true });
+  }
+
+  _unbindRepositionEvents() {
+    if (!this._repositionHandler) return;
+    window.removeEventListener("resize", this._repositionHandler, { capture: false });
+    window.removeEventListener("scroll", this._repositionHandler, { capture: true });
+    this._repositionHandler = null;
+    if (this._repositionRAF) cancelAnimationFrame(this._repositionRAF), this._repositionRAF = 0;
+  }
+
+  /**
+   * 将确认对话框吸附在触发按钮附近，避免重叠，并保持完全在视口内。
+   * 方向优先级：下（默认）> 上 > 右 > 左；若都放不下，选空间最大方向并夹紧。
+   */
+  _positionConfirmNear() {
+    const dlg = this._confirmDialogEl;
+    const anchor = this._confirmAnchorEl;
+    if (!dlg) return;
+
+    const vw = Math.max(document.documentElement.clientWidth, window.innerWidth || 0);
+    const vh = Math.max(document.documentElement.clientHeight, window.innerHeight || 0);
+    const MARGIN = 8;    // 视口边缘留白
+    const GAP = 12;      // 与按钮间距
+
+    const dW = dlg.offsetWidth;
+    const dH = dlg.offsetHeight;
+
+    let left = (vw - dW) / 2;
+    let top  = (vh - dH) / 2;
+
+    if (anchor && anchor.getBoundingClientRect) {
+      const r = anchor.getBoundingClientRect();
+
+      const spaceTop = r.top - MARGIN;
+      const spaceBottom = vh - r.bottom - MARGIN;
+      const spaceLeft = r.left - MARGIN;
+      const spaceRight = vw - r.right - MARGIN;
+
+      // 能完全容纳？
+      const canBottom = dH + GAP <= spaceBottom;
+      const canTop    = dH + GAP <= spaceTop;
+      const canRight  = dW + GAP <= spaceRight;
+      const canLeft   = dW + GAP <= spaceLeft;
+
+      // 按优先级选择方向：下 > 上 > 右 > 左
+      let placement = null;
+      if (canBottom || canTop || canRight || canLeft) {
+        if (canBottom) placement = "bottom";
+        else if (canTop) placement = "top";
+        else if (canRight) placement = "right";
+        else placement = "left";
+      } else {
+        // 都放不下，选空间最大的方向
+        const spaces = [
+          ["bottom", spaceBottom],
+          ["top", spaceTop],
+          ["right", spaceRight],
+          ["left", spaceLeft],
+        ].sort((a,b)=>b[1]-a[1]);
+        placement = spaces[0][0];
+      }
+
+      if (placement === "bottom") {
+        top = Math.min(vh - dH - MARGIN, r.bottom + GAP);
+        left = r.left + (r.width - dW) / 2;
+        dlg.style.transform = "translateY(-6px)";
+      } else if (placement === "top") {
+        top = Math.max(MARGIN, r.top - GAP - dH);
+        left = r.left + (r.width - dW) / 2;
+        dlg.style.transform = "translateY(6px)";
+      } else if (placement === "right") {
+        left = Math.min(vw - dW - MARGIN, r.right + GAP);
+        top = r.top + (r.height - dH) / 2;
+        dlg.style.transform = "translateX(-6px)";
+      } else { // left
+        left = Math.max(MARGIN, r.left - GAP - dW);
+        top = r.top + (r.height - dH) / 2;
+        dlg.style.transform = "translateX(6px)";
+      }
+
+      // 夹紧到视口内
+      left = Math.min(Math.max(left, MARGIN), vw - dW - MARGIN);
+      top  = Math.min(Math.max(top , MARGIN), vh - dH - MARGIN);
+    }
+
+    dlg.style.left = `${Math.round(left)}px`;
+    dlg.style.top  = `${Math.round(top)}px`;
+  }
+
+  _executeTap(key, cfg) {
+    if (!key) return;
+
+    clearTimeout(this._highlightRollbackTimer);
+    clearTimeout(this._contentUpdateTimer);
+
+    this._isUpdatingOptimistically = true;
+    this._optimisticHighlightKey = key;
+
+    this._allowAnimation = true;
+    this._scheduleMove();
+
+    this._contentUpdateTimer = setTimeout(() => {
+      this._isUpdatingOptimistically = false;
+      this._applyButtonContent();
+    }, 300);
+
+    this._highlightRollbackTimer = setTimeout(() => {
+      this._optimisticHighlightKey = null;
+      this._updateHighlightTarget();
+    }, this._syncStateDelay);
 
     const rawAction = cfg.tap_action || this._finalConfig.tap_action;
     if (!rawAction || !this._hass) return;
 
     const actionConfig = this._evaluateActionConfig(rawAction);
-    if (actionConfig.action === "none") return;
+    if (actionConfig?.action === "none") return;
 
     const dispatch = (eventName, detail) => {
       this.dispatchEvent(new CustomEvent(eventName, { bubbles: true, composed: true, detail }));
@@ -481,9 +761,7 @@ class GridButtonCard extends HTMLElement {
   /* ================== Highlight ================== */
   _updateHighlightTarget() {
     const newKey = this._calcHighlightKey();
-    if (newKey !== this._highlightKey) {
-      this._highlightKey = newKey;
-    }
+    if (newKey !== this._highlightKey) this._highlightKey = newKey;
     this._scheduleMove();
   }
 
@@ -503,21 +781,15 @@ class GridButtonCard extends HTMLElement {
   _scheduleMove(doubleFrame = false) {
     if (this._rafMove) cancelAnimationFrame(this._rafMove);
     this._rafMove = requestAnimationFrame(() => {
-      if (doubleFrame) {
-        requestAnimationFrame(() => this._moveHighlight(/*fromDouble*/ true));
-      } else {
-        this._moveHighlight();
-      }
+      if (doubleFrame) requestAnimationFrame(() => this._moveHighlight(true));
+      else this._moveHighlight();
     });
   }
-
-
 
   _moveHighlight() {
     const newKey = this._optimisticHighlightKey || this._highlightKey;
     const oldKey = this._lastTarget.key;
     const wrapper = this.shadowRoot?.querySelector(".grid-container");
-
     if (!wrapper) return;
 
     if (!this._hlEl) {
@@ -541,7 +813,6 @@ class GridButtonCard extends HTMLElement {
 
     if (!newKey) {
       this._hlEl.style.opacity = "0";
-      this._hlEl.style.transform = "scale(0)";
       this._lastTarget.key = "";
       return;
     }
@@ -549,51 +820,41 @@ class GridButtonCard extends HTMLElement {
     const esc = (window.CSS?.escape ? CSS.escape(newKey) : newKey.replace(/"/g, '\\"'));
     const gridItem = this.shadowRoot?.querySelector(`.grid-item[data-area="${esc}"]`);
     const btn = this.shadowRoot?.querySelector(`.btn[data-key="${esc}"]`);
-    
     if (!gridItem || !btn) {
-    // 不隐藏；多半是刚切回还没渲染到 DOM
-    if (this._measureRetryCount < this._measureRetryMax) {
-      this._measureRetryCount++;
-      this._scheduleMove(/*doubleFrame*/ true);
+      if (this._measureRetryCount < this._measureRetryMax) {
+        this._measureRetryCount++;
+        this._scheduleMove(true);
+      }
+      return;
     }
-    return;
-  }
 
     const color = btn.dataset.highlightColor || "rgba(0, 150, 255, 0.18)";
 
-    // 🔑 核心修复: 使用 offsetLeft/Top/Width/Height 替代 getBoundingClientRect()
-    // 这可以获取相对于父容器的、不受 transform 影响的稳定布局坐标。
     const targetX = gridItem.offsetLeft;
     const targetY = gridItem.offsetTop;
     const targetW = gridItem.offsetWidth;
     const targetH = gridItem.offsetHeight;
 
-    // 读取目标按钮的“真实”圆角并同步到高亮层1
     const cs = getComputedStyle(btn);
     this._hlEl.style.borderTopLeftRadius     = cs.borderTopLeftRadius;
     this._hlEl.style.borderTopRightRadius    = cs.borderTopRightRadius;
     this._hlEl.style.borderBottomRightRadius = cs.borderBottomRightRadius;
     this._hlEl.style.borderBottomLeftRadius  = cs.borderBottomLeftRadius;
 
-    // —— NEW: 不可见/零尺寸时，不隐藏高亮；用 rAF 必达式重试直到成功 —— 
-    const hostInvisible = !this.offsetParent || this.offsetWidth === 0 || this.offsetHeight === 0;
+    const rects = (this.shadowRoot.host && this.shadowRoot.host.getClientRects) ? this.shadowRoot.host.getClientRects() : [];
+    const hostInvisible = (rects.length === 0) || wrapper.offsetWidth === 0 || wrapper.offsetHeight === 0;
     const needRetry = hostInvisible || targetW <= 0 || targetH <= 0;
-
     if (needRetry) {
-      // 保持现有高亮（不要把它缩没/opacity=0），避免“直接没高亮”的观感
       if (this._measureRetryCount < this._measureRetryMax) {
         this._measureRetryCount++;
-        this._scheduleMove(/*doubleFrame*/ true); // 下一帧继续尝试测量
+        this._scheduleMove(true);
       } else {
-        // 超过上限：作为兜底，仍然不隐藏；下次 states/resize 会把它拉回
         this._measureRetryCount = 0;
       }
       return;
     }
 
-    // 一旦拿到有效尺寸，清零计数
     this._measureRetryCount = 0;
-
 
     const { key: lastKey, x, y, w, h, color: lastColor } = this._lastTarget;
     if (
@@ -601,21 +862,18 @@ class GridButtonCard extends HTMLElement {
       Math.abs(targetX - x) < 1 && Math.abs(targetY - y) < 1 &&
       Math.abs(targetW - w) < 1 && Math.abs(targetH - h) < 1 &&
       lastColor === color
-    ) {
-      return;
-    }
+    ) return;
 
     this._lastTarget = { key: newKey, x: targetX, y: targetY, w: targetW, h: targetH, color };
-    
+
     const useAnimation = this._allowAnimation && this._firstShown;
     if (this._allowAnimation) this._allowAnimation = false;
 
-    if (!this._firstShown || !useAnimation) {
-      this._hlEl.style.transition = 'none';
-    }
+    if (!this._firstShown || !useAnimation) this._hlEl.style.transition = 'none';
 
     this._hlEl.style.opacity = '1';
-    this._hlEl.style.transform = `translate(${targetX}px, ${targetY}px)`;
+    this._hlEl.style.left = `${targetX}px`;
+    this._hlEl.style.top = `${targetY}px`;
     this._hlEl.style.width = `${targetW}px`;
     this._hlEl.style.height = `${targetH}px`;
     this._hlEl.style.backgroundColor = color;
@@ -623,13 +881,11 @@ class GridButtonCard extends HTMLElement {
     if (!this._firstShown) this._firstShown = true;
 
     if (!useAnimation) {
-      requestAnimationFrame(() => {
-        if (this._hlEl) this._hlEl.style.transition = '';
-      });
+      requestAnimationFrame(() => { if (this._hlEl) this._hlEl.style.transition = ''; });
     }
   }
 
-  /* ================== Template & Helpers (No changes) ================== */
+  /* ================== Template & Helpers ================== */
   _evaluateTemplate(value) {
     if (typeof value !== "string") return value;
     const s = value.trim();
@@ -825,7 +1081,7 @@ if (!customElements.get("grid-button-card")) {
   window.customCards = window.customCards || [];
   window.customCards.push({
     type: "grid-button-card",
-    name: "Grid Button Card v1.0.1",
+    name: "Grid Button Card v1.1.0",
     description: "Grid Button Card 是一个高度可定制的 Lovelace 卡片，它允许您在一个卡片内创建灵活的按钮网格布局",
   });
 }
