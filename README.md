@@ -264,6 +264,8 @@ button_grid:
   button1:
     name: 按钮1
     sync_state: on
+    confirm_dialog: true
+    confirm_dialog_content: 你确定要操作吗？
     state: |
       [[[ return states[`your_entity_id`].state ]]]
     icon: /local/icon/your_on_icon.svg
