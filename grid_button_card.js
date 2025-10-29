@@ -1,4 +1,4 @@
-// v1.1.0
+// v1.1.1
 class GridButtonCard extends HTMLElement {
   constructor() {
     super();
@@ -123,7 +123,7 @@ class GridButtonCard extends HTMLElement {
       .part img { max-width: 100%; max-height: 100%; object-fit: contain; }
       .part ha-icon { display: inline-block; }
 
-      /* 高亮层使用 top/left/width/height 过渡（iOS 稳定） */
+      /* 高亮层：top/left/width/height 过渡（iOS 稳定） */
       .gbc-highlight {
         position: absolute;
         top: 0; left: 0;
@@ -432,19 +432,24 @@ class GridButtonCard extends HTMLElement {
   _ensureGlobalConfirmLayer() {
     if (this._confirmRoot && document.body.contains(this._confirmRoot)) return;
 
-    // Backdrop
+    const animMs = Number(this._finalConfig.confirm_dialog_anim_ms) || 500;
+    const easing = this._finalConfig.confirm_dialog_anim_ease || "ease";
+
+    // Backdrop（支持淡入淡出）
     const backdrop = document.createElement("div");
     backdrop.style.position = "fixed";
     backdrop.style.inset = "0";
     backdrop.style.zIndex = "2147483000";
     backdrop.style.display = "none";
-    backdrop.style.background = this._finalConfig.confirm_dialog_backdrop || "rgba(0,0,0,0.60)";
+    backdrop.style.opacity = "0";   // 初始透明
+    backdrop.style.transition = `opacity ${animMs}ms ${easing}`;
+    backdrop.style.background = this._finalConfig.confirm_dialog_backdrop || "rgba(0,0,0,0.50)";
     backdrop.addEventListener("click", (e) => { if (e.target === backdrop) this._hideConfirm(); });
 
-    // Dialog
+    // Dialog（支持淡入 + 轻微位移 + 轻微缩放）
     const dialog = document.createElement("div");
     dialog.style.position = "fixed";
-    dialog.style.zIndex = "2147483001";    // 关键：高于遮罩
+    dialog.style.zIndex = "2147483001";
     dialog.style.minWidth = "220px";
     dialog.style.maxWidth = "80%";
     dialog.style.maxHeight = "70vh";
@@ -455,10 +460,10 @@ class GridButtonCard extends HTMLElement {
     dialog.style.boxShadow = "0 10px 30px rgba(0,0,0,.25)";
     dialog.style.padding = "14px 16px";
     dialog.style.boxSizing = "border-box";
-    dialog.style.opacity = "0";
-    dialog.style.transform = "translateY(6px)";
-    dialog.style.transition = "transform 160ms ease, opacity 160ms ease";
-    dialog.style.display = "none";         // 隐藏时真正不占位
+    dialog.style.display = "none";
+    dialog.style.opacity = "0"; // 初始透明
+    dialog.style.transform = "translateY(6px) scale(.98)"; // 初始轻微偏移+缩放
+    dialog.style.transition = `transform ${animMs}ms cubic-bezier(0.2,0.9,0.2,1), opacity ${animMs}ms ${easing}`;
     dialog.setAttribute("role", "dialog");
     dialog.setAttribute("aria-modal", "true");
     dialog.addEventListener("click", (e) => e.stopPropagation());
@@ -528,20 +533,26 @@ class GridButtonCard extends HTMLElement {
     this._confirmTextEl.textContent = text || "确定要执行该操作吗？";
     this._confirmAnchorEl = anchorEl || null;
 
-    // 先显示遮罩与对话框
-    this._confirmRoot.style.display = "block";
+    const backdrop = this._confirmRoot;
     const dlg = this._confirmDialogEl;
+
+    // 显示并设为可测量
+    backdrop.style.display = "block";
     dlg.style.display = "block";
     dlg.style.opacity = "0";
-    dlg.style.transform = "translateY(6px)";
+    dlg.style.transform = "translateY(6px) scale(.98)";
     dlg.style.left = "0px";
     dlg.style.top = "0px";
 
-    // 定位并入场
+    // 先定位（会根据按钮方向设置初始 transform 偏移）
     this._positionConfirmNear();
+
+    // 下一帧启动过渡：遮罩淡入、对话框淡入+位移归零
     requestAnimationFrame(() => {
+      backdrop.style.opacity = "1";
       dlg.style.opacity = "1";
-      dlg.style.transform = "translateY(0)";
+      // 归零到最终位：不再偏移，缩放回 1
+      dlg.style.transform = "translate(0,0) scale(1)";
     });
 
     this._bindRepositionEvents();
@@ -550,14 +561,32 @@ class GridButtonCard extends HTMLElement {
 
   _hideConfirm() {
     if (!this._confirmRoot || !this._confirmShown) return;
+    const backdrop = this._confirmRoot;
     const dlg = this._confirmDialogEl;
-    dlg.style.transform = "translateY(6px)";
+
+    // 退出过渡：遮罩淡出；对话框轻微回弹+淡出
+    backdrop.style.opacity = "0";
     dlg.style.opacity = "0";
-    // 动画后真正隐藏
-    setTimeout(() => {
-      if (this._confirmRoot) this._confirmRoot.style.display = "none";
+    // 轻微朝着按钮方向回退一点（如果没有 anchor，也给个默认下方向）
+    const dir = dlg.dataset._placement || "bottom";
+    if (dir === "bottom") dlg.style.transform = "translateY(6px) scale(.98)";
+    else if (dir === "top") dlg.style.transform = "translateY(-6px) scale(.98)";
+    else if (dir === "right") dlg.style.transform = "translateX(6px) scale(.98)";
+    else dlg.style.transform = "translateX(-6px) scale(.98)";
+
+    // 过渡结束后真正隐藏
+    const done = () => {
+      if (backdrop) backdrop.style.display = "none";
       if (dlg) dlg.style.display = "none";
-    }, 160);
+      dlg.removeEventListener("transitionend", onDlgEnd);
+      backdrop.removeEventListener("transitionend", onBdEnd);
+    };
+    let dlgDone = false, bdDone = false;
+    const onDlgEnd = (e) => { if (e.propertyName === "opacity") { dlgDone = true; if (bdDone) done(); } };
+    const onBdEnd  = (e) => { if (e.propertyName === "opacity") { bdDone = true;  if (dlgDone) done(); } };
+    dlg.addEventListener("transitionend", onDlgEnd, { once: false });
+    backdrop.addEventListener("transitionend", onBdEnd, { once: false });
+
     this._pendingConfirm = null;
     this._confirmShown = false;
     this._confirmAnchorEl = null;
@@ -600,8 +629,8 @@ class GridButtonCard extends HTMLElement {
   }
 
   /**
-   * 将确认对话框吸附在触发按钮附近，避免重叠，并保持完全在视口内。
-   * 方向优先级：下（默认）> 上 > 右 > 左；若都放不下，选空间最大方向并夹紧。
+   * 贴靠触发按钮附近，方向优先级：下 > 上 > 右 > 左；保证完全在视口内。
+   * 同时把选定方向存到 dataset._placement，供出场动效参考。
    */
   _positionConfirmNear() {
     const dlg = this._confirmDialogEl;
@@ -611,13 +640,14 @@ class GridButtonCard extends HTMLElement {
     const vw = Math.max(document.documentElement.clientWidth, window.innerWidth || 0);
     const vh = Math.max(document.documentElement.clientHeight, window.innerHeight || 0);
     const MARGIN = 8;    // 视口边缘留白
-    const GAP = 12;      // 与按钮间距
+    const GAP = 15;      // 与按钮间距
 
     const dW = dlg.offsetWidth;
     const dH = dlg.offsetHeight;
 
     let left = (vw - dW) / 2;
     let top  = (vh - dH) / 2;
+    let placement = "bottom";
 
     if (anchor && anchor.getBoundingClientRect) {
       const r = anchor.getBoundingClientRect();
@@ -627,21 +657,17 @@ class GridButtonCard extends HTMLElement {
       const spaceLeft = r.left - MARGIN;
       const spaceRight = vw - r.right - MARGIN;
 
-      // 能完全容纳？
       const canBottom = dH + GAP <= spaceBottom;
       const canTop    = dH + GAP <= spaceTop;
       const canRight  = dW + GAP <= spaceRight;
       const canLeft   = dW + GAP <= spaceLeft;
 
-      // 按优先级选择方向：下 > 上 > 右 > 左
-      let placement = null;
       if (canBottom || canTop || canRight || canLeft) {
         if (canBottom) placement = "bottom";
         else if (canTop) placement = "top";
         else if (canRight) placement = "right";
         else placement = "left";
       } else {
-        // 都放不下，选空间最大的方向
         const spaces = [
           ["bottom", spaceBottom],
           ["top", spaceTop],
@@ -654,26 +680,26 @@ class GridButtonCard extends HTMLElement {
       if (placement === "bottom") {
         top = Math.min(vh - dH - MARGIN, r.bottom + GAP);
         left = r.left + (r.width - dW) / 2;
-        dlg.style.transform = "translateY(-6px)";
+        dlg.style.transform = "translateY(-6px) scale(.98)";
       } else if (placement === "top") {
         top = Math.max(MARGIN, r.top - GAP - dH);
         left = r.left + (r.width - dW) / 2;
-        dlg.style.transform = "translateY(6px)";
+        dlg.style.transform = "translateY(6px) scale(.98)";
       } else if (placement === "right") {
         left = Math.min(vw - dW - MARGIN, r.right + GAP);
         top = r.top + (r.height - dH) / 2;
-        dlg.style.transform = "translateX(-6px)";
+        dlg.style.transform = "translateX(-6px) scale(.98)";
       } else { // left
         left = Math.max(MARGIN, r.left - GAP - dW);
         top = r.top + (r.height - dH) / 2;
-        dlg.style.transform = "translateX(6px)";
+        dlg.style.transform = "translateX(6px) scale(.98)";
       }
 
-      // 夹紧到视口内
       left = Math.min(Math.max(left, MARGIN), vw - dW - MARGIN);
       top  = Math.min(Math.max(top , MARGIN), vh - dH - MARGIN);
     }
 
+    dlg.dataset._placement = placement;
     dlg.style.left = `${Math.round(left)}px`;
     dlg.style.top  = `${Math.round(top)}px`;
   }
@@ -1081,7 +1107,7 @@ if (!customElements.get("grid-button-card")) {
   window.customCards = window.customCards || [];
   window.customCards.push({
     type: "grid-button-card",
-    name: "Grid Button Card v1.1.0",
+    name: "Grid Button Card v1.1.1",
     description: "Grid Button Card 是一个高度可定制的 Lovelace 卡片，它允许您在一个卡片内创建灵活的按钮网格布局",
   });
 }
